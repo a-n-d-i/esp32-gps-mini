@@ -2,14 +2,16 @@
 
 import asyncio
 import gc
-import sys
-import time
+from sys import print_exception
 from collections import deque
 from devices import Logger
 try:
     from debug import DEBUG
 except ImportError:
     DEBUG=False
+
+# Seconds to wait before reconnecting to caster after failure
+RECONNECT_TIMEOUT = 10
 
 log = Logger.getLogger().log
 
@@ -89,7 +91,8 @@ class Base():
                 except (AttributeError, OSError):
                     pass
                 # Wait before trying to reconnect
-                await asyncio.sleep(3)
+                await asyncio.sleep(RECONNECT_TIMEOUT)
+
 
 class Client(Base):
 
@@ -104,31 +107,36 @@ class Client(Base):
         while True:
             if self.reader:
                 try:
+                    # Regular small reads to avoid blocking (RTCM messages are typically < 512 bytes, max 1023)
                     data = await self.reader.read(128)
                     if data:
                         yield data
                     else:
                         # Stream closed
-                        log(f"[{self.name}] Connection error. Reconnecting...")
-                        try:
-                            self.writer.close()
-                            await self.writer.wait_closed()
-                        except OSError as e:
-                            if DEBUG:
-                                sys.print_exception(e)
-                            pass
-                        await asyncio.sleep(1)
-                        await self.caster_connect()
-                except (OSError, asyncio.IncompleteReadError):
-                    # Would block / timeout
-                    await asyncio.sleep_ms(100)
-                    continue
+                        raise OSError
+                except OSError:
+                    if DEBUG:
+                        print_exception(e)
+                    log(f"[{self.name}] Caster read error. Closing connection...")
+                    try:
+                        self.reader.close()
+                        await self.reader.wait_closed()
+                    except OSError as e:
+                        if DEBUG:
+                            print_exception(e)
+                        pass
+                    finally:
+                        self.reader = None
             else:
                 # Reader not ready yet...
                 await asyncio.sleep(1)
 
     async def run(self):
-        await self.caster_connect()
+        while True:
+            await self.caster_connect()
+            while self.reader:
+                # Long sleep while connection established (equivalent to reconnect timeout)
+                await asyncio.sleep(RECONNECT_TIMEOUT)
 
 
 class Server(Base):
@@ -145,12 +153,11 @@ class Server(Base):
                 self.writer.write(data)
                 await self.writer.drain()
             except OSError:
-                log(f"[{self.name}] Data send error. Closing connection...")
+                log(f"[{self.name}] Caster write error. Closing connection...")
                 try:
                     self.writer.close()
                     await self.writer.wait_closed()
                 except OSError:
-                    # Ignore send failures
                     pass
                 finally:
                     self.writer = None
@@ -160,7 +167,7 @@ class Server(Base):
             await self.caster_connect()
             while self.writer:
                 # Long sleep while connection established (equivalent to reconnect timeout)
-                await asyncio.sleep(3)
+                await asyncio.sleep(RECONNECT_TIMEOUT)
 
 
 class Caster():
@@ -255,7 +262,7 @@ class Caster():
             await writer.wait_closed()
         except OSError as e:
             if DEBUG:
-                sys.print_exception(e)
+                print_exception(e)
         if conn_type == "server":
             # Remove all associated clients and delete mount
             for client in self.mounts[mount]["clients"]:
@@ -266,7 +273,7 @@ class Caster():
                 except OSError as e:
                     # Client already gone
                     if DEBUG:
-                        sys.print_exception(e)
+                        print_exception(e)
             del self.mounts[mount]
 
     async def probe_connections(self):
@@ -274,7 +281,7 @@ class Caster():
         evry N seconds to check still connected."""
 
         # Seconds to sleep between probe attempts
-        probe_cycle = 5
+        probe_cycle = 10
 
         while True:
             # Sleep if no servers and no clients
@@ -283,7 +290,7 @@ class Caster():
                 continue
 
             for mount, conns in self.mounts.items():
-                for s_writer, s_reader in list(conns["servers"].items()):
+                for s_writer, _ in list(conns["servers"].items()):
                     try:
                         s_writer.write(b"")
                         await s_writer.drain()
@@ -294,10 +301,10 @@ class Caster():
                             await s_writer.wait_closed()
                         except OSError as e:
                             if DEBUG:
-                                sys.print_exception(e)
+                                print_exception(e)
                     except OSError as e:
                         if DEBUG:
-                            sys.print_exception(e)
+                            print_exception(e)
                 for c_writer, c_reader in list(conns["clients"].items()):
                     try:
                         probe = await c_reader.read(128)
@@ -308,7 +315,7 @@ class Caster():
                                 await c_writer.wait_closed()
                             except OSError as e:
                                 if DEBUG:
-                                    sys.print_exception(e)
+                                    print_exception(e)
                     except OSError:
                         await self.drop_connection(mount, c_writer)
                         try:
@@ -316,7 +323,7 @@ class Caster():
                             await c_writer.wait_closed()
                         except OSError as e:
                             if DEBUG:
-                                sys.print_exception(e)
+                                print_exception(e)
 
             gc.collect()
             await asyncio.sleep(probe_cycle)
@@ -363,7 +370,7 @@ class Caster():
             await self.drop_connection(mount, s_writer, conn_type="server")
         except Exception as e:
             if DEBUG:
-                sys.print_exception(e)
+                print_exception(e)
             await self.drop_connection(mount, s_writer, conn_type="server")
 
     async def handle_data(self):
@@ -375,7 +382,8 @@ class Caster():
                             log(f"Starting task for mount: {mount}")
                         task = asyncio.create_task(self.server_loop(mount, conns, s_writer, s_reader))
                         self.server_tasks[mount] = task
-            await asyncio.sleep_ms(100)
+            await asyncio.sleep(1)
+
 
 
     async def handle_connection(self, reader, writer):
@@ -455,7 +463,6 @@ class Caster():
                 await writer.wait_closed()
             except OSError:
                 pass
-        asyncio.sleep(0)
 
 
     async def run(self):
