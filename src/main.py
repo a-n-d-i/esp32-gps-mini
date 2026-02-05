@@ -6,6 +6,9 @@ from time import sleep_ms
 from net import Net
 import config as cfg
 from devices import Logger
+
+# Enable debugging for current thread
+
 try:
     from debug import DEBUG
 except ImportError:
@@ -28,7 +31,6 @@ class ESP32GPS():
         self.ntrip_server = None
         self.ntrip_client = None
         self.tasks = []
-        self.shell_callbacks = {}
 
     def gps_reset(self):
         if (
@@ -95,14 +97,7 @@ class ESP32GPS():
             self.net.enable_wifi(ssid=cfg.WIFI_SSID, key=cfg.WIFI_PSK)
         # Start ESPNow if peers provided
         peers = getattr(cfg, "ESPNOW_PEERS", set())
-        if (espnow_mode := getattr(cfg, "ESPNOW_MODE", None)):
-            self.net.enable_espnow(peers=peers)
-            if hasattr(cfg, "ESPNOW_DISCOVER_PEERS"):
-                # Regularly broadcast presence for peer discovery
-                self.tasks.append(asyncio.create_task(self.net.espnow_broadcast()))
-                if espnow_mode == "sender":
-                    # Read occasionally to look for peers
-                    self.tasks.append(asyncio.create_task(self.net.espnow_find_peers()))
+
 
     def esp32_write_data(self, value):
         """Callback to run if device is written to (BLE, Serial)"""
@@ -111,26 +106,18 @@ class ESP32GPS():
     async def ntrip_client_read(self):
         """Read data from NTRIP client and write to GPS device."""
         while True:
-            async for data in ntrip_client.iter_data():
-                self.esp32_write_data(data)
-
-    async def espnow_reader(self):
-        """Read from ESPNow in async loop, and send for outputting."""
-        discover_peers = getattr(cfg, "ESPNOW_DISCOVER_PEERS", False)
-        while True:
             try:
-                data = await self.net.espnow_recv(discover_peers=discover_peers)
-                if data:
-                    await self.gps_data(data)
+                data = await self.ntrip_client.iter_data()
+                #print(data)
+                self.esp32_write_data(data)
             except Exception as e:
                 print_exception(e)
-            await asyncio.sleep(0)
 
     async def gps_reader(self):
         # FIXME: Move to code where this task is instantiated
+        log("Starting GPS reader task.")
         if (
             "server" in getattr(cfg, "NTRIP_MODE", []) or
-            getattr(cfg, "ESPNOW_MODE", None) == "sender" or
             hasattr(cfg, "ENABLE_SERIAL_CLIENT") or
             (self.blue and self.blue.is_connected())
         ):
@@ -138,7 +125,8 @@ class ESP32GPS():
                 try:
                     data = self.gps.uart.read()
                     if data:
-                        await self.gps_data(data)
+                        for line in data.splitlines(keepends=True):
+                            await self.gps_data(line)
                 except Exception as e:
                     print_exception(e)
                 await asyncio.sleep_ms(0)
@@ -156,6 +144,9 @@ class ESP32GPS():
         # Handle NMEA sentences
         if line.startswith(b"$") and line.endswith(b"\r\n"):
             isNMEA = True
+            if line.startswith(b"$GPGGA") or line.startswith(b"$GNGGA"):
+                if self.ntrip_client:
+                    self.ntrip_client.set_gga_sentence(line)
             if cfg.ENABLE_GPS and cfg.PQTMEPE_TO_GGST:
                 if line.startswith(b"$GNRMC"):
                     # Extract UTC_TIME (as str) for use in GST sentence creation
@@ -191,37 +182,7 @@ class ESP32GPS():
         # Settle
         await asyncio.sleep(0)
 
-    def setup_shell_callbacks(self):
-        for cmd in ["CFG", "GPS", "RESET", "RESETGPS"]:
-            self.shell_callbacks[cmd] = getattr(self, f"cb_{cmd}")
 
-    # Callback functions for shell remote commands
-    def cb_CFG(self, opts):
-        """Report current config or update config.py on the device."""
-        conf_dict = { k: getattr(cfg, k) for k in dir(cfg) if k.isupper() }
-        if not opts:
-            # Return current config
-            return "\n".join([f"{k}={v}" for k, v in conf_dict.items()])
-
-        try:
-            key, val = opts.split("=")
-            # Remove whitespace from cfg args
-            key = key.strip()
-            # Try to convert the value string into a python object
-            val = eval(val.strip())
-            conf_dict[key] = val
-        except ValueError as e:
-            return(f"Invalid config. Syntax: CFG KEY=val (strings must be quoted). {e}")
-        # Get all current config attrs, and add/update this one
-        try:
-            # Write a temporary config file, then replace original
-            with open("config.py.tmp", "w") as conf_f:
-                for k, v in conf_dict.items():
-                    conf_f.write(f"{k} = {repr(v)}\n")
-            rename("config.py.tmp", "config.py")
-            return(f"Updated config: {key}={repr(val)}")
-        except OSError as e:
-            return(f"Unable to save config to file: {e}")
 
     def cb_GPS(self, opts):
         """Write a command to the GPS device."""
@@ -268,39 +229,12 @@ class ESP32GPS():
         # Set up wifi
         self.setup_networks()
 
-        # Set up remote shell
-        if hasattr(cfg, "ENABLE_SHELL"):
-            from shell import Shell
-            self.setup_shell_callbacks()
-            kwargs = {}
-            if (addr := getattr(cfg, "SHELL_BIND_ADDRESS", None)):
-                kwargs["bind_address"] = addr
-            if (port := getattr(cfg, "SHELL_BIND_PORT", None)):
-                kwargs["bind_port"] = port
-            if (passwd := getattr(cfg, "SHELL_PASSWORD", None)):
-                kwargs["password"] = passwd
-            sh = Shell(callbacks=self.shell_callbacks, **kwargs)
-            self.tasks.append(asyncio.create_task(sh.run()))
-
         # Expect to receive gps data (from device, or ESPNOW)
-        src_data = True
-        espnow_mode = getattr(cfg, "ESPNOW_MODE", None)
         if cfg.ENABLE_GPS:
             self.setup_gps()
             self.tasks.append(asyncio.create_task(self.gps_reader()))
-            # sender goes with GPS device
-            if espnow_mode == "sender":
-                log("ESPNow: sender mode.")
-        elif espnow_mode == "receiver":
-            log("ESPNow: receiver mode.")
-            self.tasks.append(asyncio.create_task(self.espnow_reader()))
-        else:
-            log("No GPS source available. Serial, Bluetooth and NTRIP server output will be disabled.")
-            src_data = False
 
-
-        # No point enabling bluetooth if no GPS data to send
-        if src_data and cfg.ENABLE_BLUETOOTH:
+        if cfg.ENABLE_BLUETOOTH:
             from blue import Blue
             log("Enabling Bluetooth")
             self.blue = Blue(name=cfg.DEVICE_NAME)
@@ -311,18 +245,11 @@ class ESP32GPS():
         if self.net.wifi_connected:
             if cfg.NTRIP_MODE:
                 import ntrip
-            if "caster" in cfg.NTRIP_MODE:
-                self.ntrip_caster = ntrip.Caster(cfg.NTRIP_CASTER_BIND_ADDRESS, cfg.NTRIP_CASTER_BIND_PORT, cfg.NTRIP_SOURCETABLE, cfg.NTRIP_CLIENT_CREDENTIALS, cfg.NTRIP_SERVER_CREDENTIALS)
-                self.tasks.append(asyncio.create_task(self.ntrip_caster.run()))
-                # Allow Caster to start before Server/Client
-                await asyncio.sleep(2)
-            if src_data and "server" in cfg.NTRIP_MODE:
-                self.ntrip_server = ntrip.Server(cfg.NTRIP_CASTER, cfg.NTRIP_PORT, cfg.NTRIP_MOUNT, cfg.NTRIP_SERVER_CREDENTIALS)
-                self.tasks.append(asyncio.create_task(self.ntrip_server.run()))
             if cfg.ENABLE_GPS and "client" in cfg.NTRIP_MODE:
+                log("starting ntrip client")
                 self.ntrip_client = ntrip.Client(cfg.NTRIP_CASTER, cfg.NTRIP_PORT, cfg.NTRIP_MOUNT, cfg.NTRIP_CLIENT_CREDENTIALS)
                 self.tasks.append(asyncio.create_task(self.ntrip_client.run()))
-                self.tasks.append(self.ntrip_client_read())
+                self.tasks.append(asyncio.create_task(self.ntrip_client_read()))
 
         # Wait for shutdown_event signal
         await self.shutdown_event.wait()
@@ -333,9 +260,6 @@ class ESP32GPS():
         if hasattr(self.blue, "ble"):
             self.blue.ble.irq(None)
 
-        # Signal ntrip_caster to shutdown
-        if hasattr(self.ntrip_caster, "shutdown"):
-            await self.ntrip_caster.shutdown()
 
         # Clean up self
         for task in self.tasks:

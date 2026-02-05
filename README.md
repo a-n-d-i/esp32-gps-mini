@@ -1,3 +1,17 @@
+# Introduction
+This is a fork of: https://github.com/mrichar1/esp32-gps
+
+It tries to achive the following:
+
+* added GGA current position to NTRIP REQUEST to work with the german SAPOS Network / Casters
+* remove everything which is not needed for ntrip client to reduce ram usage / allow
+  parallel operation of bluetooth and wifi on nodemcu boards.
+* more robust ntrip parsing / verification
+* udp sender for gps data 
+* ensure support for the ardusimple u-blox ZED-X20P board
+  https://www.ardusimple.com/product/simplertk4-basic-starter-kit-zed-x20p/
+
+
 # ESP32 GPS
 
 Micropython code for an ESP32 device to act as an intermediate gateway for a serial GPS module and provide support for RTK/NTRIP services.

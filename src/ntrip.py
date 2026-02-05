@@ -2,8 +2,8 @@
 
 import asyncio
 import gc
+gc.enable()
 from sys import print_exception
-from collections import deque
 from devices import Logger
 try:
     from debug import DEBUG
@@ -35,6 +35,32 @@ example_data = bytes([
     0x02, 0x19, 0x8F, 0x73
 ])
 
+def calc_crc24q(message: bytes) -> int:
+    """
+    Perform CRC24Q cyclic redundancy check.
+
+    If the message includes the appended CRC bytes, the
+    function will return 0 if the message is valid.
+    If the message excludes the appended CRC bytes, the
+    function will return the applicable CRC.
+
+    :param bytes message: message
+    :return: CRC or 0
+    :rtype: int
+
+    """
+
+    poly = 0x1864CFB
+    crc = 0
+    for octet in message:
+        crc ^= octet << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= poly
+    return crc & 0xFFFFFF
+
+
 
 class Base():
 
@@ -48,10 +74,6 @@ class Base():
         self.request_headers = None
         self.reader = None
         self.writer = None
-        # Assuming avg RTCM message is 200 bytes, queue around 2048bytes of them
-        # (in usual operation, queue never grows to more than 2 with clients reading from caster)
-        self.queue = deque([], 10)
-        self.event = asyncio.Event()
 
     def build_headers(self, method, mount=None):
         mount = mount or self.mount
@@ -101,20 +123,134 @@ class Client(Base):
         super().__init__(*args, **kwargs)
         self.name = "Client"
         self.request_headers = self.build_headers(method="GET")
+        self.last_gga = None
+        self.last_gga_send_time = 0
+        self.gga_send_interval = 5  # Send GGA every 5 seconds
+
+
+        loop = asyncio.get_event_loop()
+        self.monitor = loop.create_task(self.send_gga())
+
+
+
+    def set_gga_sentence(self, gga_sentence):
+        """Store a GGA sentence to be sent to the caster.
+        
+        Args:
+            gga_sentence: NMEA GGA sentence as bytes or string
+        """
+        #if isinstance(gga_sentence, str):
+        #    gga_sentence = gga_sentence.encode('ascii')
+        self.last_gga = gga_sentence
+
+    async def send_gga(self):
+        while True:
+            try:
+                log("gga loop")
+                log("last gga %s" % self.last_gga)
+                if self.writer and self.last_gga:
+                    try:
+                        log("gga %s" % self.last_gga)
+                        self.writer.write(self.last_gga)
+                        await self.writer.drain()
+                        log("free mem %s" % gc.mem_free())
+                        log(f"[{self.name}] Sent GGA to caster: {self.last_gga}")
+                    except OSError as err:
+                        log(f"[{self.name}] Error sending GGA to caster: {err}")
+                        raise
+                    except TypeError as err:
+                        log(f"[{self.name}] Error with typing: {err}")
+                await asyncio.sleep(5)
+            except (EOFError, OSError) as e:
+                # wait for connection to be re-established
+                await asyncio.sleep(5)
+    # TODO: catch OSError: [Errno 9] EBADF and retry
+
+
 
     async def iter_data(self):
         """Read data from caster and yield as requested."""
         while True:
             if self.reader:
                 try:
+
+                    # nach zeilen splitten und dann entscheiden ob rtcm oder http?
+                    # todo: seek for first bytes...
                     # Regular small reads to avoid blocking (RTCM messages are typically < 512 bytes, max 1023)
-                    data = await self.reader.read(128)
-                    if data:
-                        yield data
+                    # maybe detect \r\n as delimeter and then log all non rtcm as possible http errors?
+
+                    first_byte = None
+                    second_byte = None
+
+
+                    while True:
+                        log("iter loop")
+
+
+
+
+                        if first_byte and first_byte[0] == 0xd3:
+                            log("First byte is 0xd3")
+                            second_byte = await self.reader.readexactly(1)
+                            if second_byte[0] == 0x00:
+                                log("Second byte is 0x00")
+                                hdr3 = await self.reader.readexactly(1)
+                                size = (second_byte[0] << 8) | hdr3[0]
+                                payload = await self.reader.readexactly(size)
+                                crc = await self.reader.readexactly(3)
+                                raw_data = first_byte + second_byte + hdr3 + payload + crc
+                                print(raw_data)
+                                res = calc_crc24q(raw_data)
+                                if res == 0:
+                                    return raw_data
+                                else:
+                                    # invalid packet
+                                    continue
+                            else:
+                                first_byte = second_byte
+                                continue
+                        else:
+                            first_byte = await self.reader.readexactly(1)
+                            log("first byte %s" % str(first_byte))
+
+
+
+
+
+                    #if first_byte[0] == 0xd3:
+                        #    second_byte = await self.reader.readexactly(1)
+
+                        #    else:
+                    """
+                    # check for empty_bytes = b''?
+                    hdr = await self.reader.readexactly(2)
+                    
+                    
+                    if hdr[0] == 0xd3:
+                        log("RTCM Message")
+                    else:
+                        log("not RTCM")
+                    # RTCM3 (byte1 = 0xd3; byte2 = 0b000000**)
+                    hdr3 = await self.reader.readexactly(1)
+                    size = (hdr[1] << 8) | hdr3[0]
+                    payload = await self.reader.readexactly(size)
+                    crc = await self.reader.readexactly(3)
+                    raw_data = hdr + hdr3 + payload + crc
+                    #print(raw_data)
+                    res = calc_crc24q(raw_data)
+                    if res == 0:
+                        return raw_data
+
+                    #data = await self.reader.read(128)
+                    #if data:
+                        #print("got data")
+                    #    return data
                     else:
                         # Stream closed
                         raise OSError
-                except OSError:
+                    """
+
+                except (EOFError, OSError) as e:
                     if DEBUG:
                         print_exception(e)
                     log(f"[{self.name}] Caster read error. Closing connection...")
@@ -127,6 +263,7 @@ class Client(Base):
                         pass
                     finally:
                         self.reader = None
+
             else:
                 # Reader not ready yet...
                 await asyncio.sleep(1)
@@ -134,360 +271,12 @@ class Client(Base):
     async def run(self):
         while True:
             await self.caster_connect()
-            while self.reader:
+
+            log("connrcted")
+            while self.reader and self.writer:
+                log("loop")
+                #if self.last_gga:
+                #    log( self.last_gga)
                 # Long sleep while connection established (equivalent to reconnect timeout)
                 await asyncio.sleep(RECONNECT_TIMEOUT)
 
-
-class Server(Base):
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.name = "Server"
-        self.request_headers = self.build_headers(method="POST", mount=self.mount)
-
-    async def send_data(self, data):
-        """Send data to the caster."""
-        if self.writer:
-            try:
-                self.writer.write(data)
-                await self.writer.drain()
-            except OSError:
-                log(f"[{self.name}] Caster write error. Closing connection...")
-                try:
-                    self.writer.close()
-                    await self.writer.wait_closed()
-                except OSError:
-                    pass
-                finally:
-                    self.writer = None
-
-    async def run(self):
-        while True:
-            await self.caster_connect()
-            while self.writer:
-                # Long sleep while connection established (equivalent to reconnect timeout)
-                await asyncio.sleep(RECONNECT_TIMEOUT)
-
-
-class Caster():
-
-    def __init__(self, bind_address="0.0.0.0", bind_port=2101, sourcetable="", cli_creds="c:c", srv_creds="c:c"):
-        self.name = "Caster"
-        self.bind_address = bind_address
-        self.bind_port = bind_port
-        self.shutdown_event = asyncio.Event()
-        self.sourcetable = sourcetable.replace("\n", "\r\n").encode() or "STR;ESP32;ESP32_GPS;RTCM 3.3;;2;GPS;;GB;51.476;0.00;0;0;;none;B;;9600;\r\n"
-        self.cli_credb64 =  b64encode(cli_creds.encode('ascii')).decode().strip()
-        self.srv_credb64 =  b64encode(srv_creds.encode('ascii')).decode().strip()
-        # { MNT: { clients: {(r, w)}, servers: {(r, w)}}}
-        self.allowed_mounts = set()
-        self.mounts = {}
-        self.server_tasks = {}
-
-    def get_allowed_mounts(self):
-        """Populate allowed_mounts dict with all mountpoints in SOURCETABLE."""
-        for line in self.sourcetable.split(b"\r\n"):
-            if line.startswith(b"STR"):
-                self.allowed_mounts.add(line.split(b";")[1].decode())
-
-    @staticmethod
-    async def send_headers(writer, content_type="text/plain", status="200", client_ver=2):
-        # Start with v1 clients - Just send ICY
-        close_conn = False
-        response_headers = "ICY 200 OK\r\n"
-        if client_ver == 2:
-            status_line = "HTTP/1.1 200 OK"
-            conn_type = "keep-alive"
-            if status == "404":
-                status_line = "HTTP/1.1 404 Invalid Mountpoint\r\n\r\n"
-                conn_type = "close"
-                close_conn = True
-            elif status == "409":
-                status_line = "HTTP/1.1 409 Mountpoint Conflict\r\n\r\n"
-                conn_type = "close"
-                close_conn = True
-            elif status == "503":
-                status_line = "HTTP/1.1 503 Mountpoint Unavailable\r\n\r\n"
-                conn_type = "close"
-                close_conn = True
-            elif status == "sourcetable":
-                status_line = "SOURCETABLE 200 OK"
-                conn_type = "close"
-            response_headers = (
-                f"{status_line}\r\n"
-                "Server: NTRIP ESP32_GPS/2.0\r\n"
-                "Ntrip-Version: Ntrip/2.0\r\n"
-                f"Content-Type: {content_type}\r\n"
-                f"Connection: {conn_type}\r\n"
-                "\r\n"
-            )
-        try:
-            writer.write(response_headers.encode())
-            await writer.drain()
-        except OSError as e:
-            writer.close()
-            await writer.wait_closed()
-
-        if close_conn:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except OSError:
-                pass
-
-    async def drop_connection(self, mount, writer, conn_type="client"):
-        """Close stale connections and remove from the list."""
-
-        conn_dict = self.mounts[mount]["servers"] if conn_type == "server" else self.mounts[mount]["clients"]
-
-        addr = writer.get_extra_info('peername')
-        title = conn_type[0].upper() + conn_type[1:]
-        log(f"[{self.name}] {title} disconnected: {addr}")
-        try:
-            conn_dict.pop(writer)
-        except KeyError:
-            pass
-        if conn_type == "server":
-            # cancel asyncio background server task
-            task = self.server_tasks.pop(mount, None)
-            if task and task is not asyncio.current_task():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except OSError as e:
-            if DEBUG:
-                print_exception(e)
-        if conn_type == "server":
-            # Remove all associated clients and delete mount
-            for client in self.mounts[mount]["clients"]:
-                try:
-                    client.write("Mountpoint unavailable. Please try again later.\r\n".encode())
-                    client.close()
-                    await client.wait_closed()
-                except OSError as e:
-                    # Client already gone
-                    if DEBUG:
-                        print_exception(e)
-            del self.mounts[mount]
-
-    async def probe_connections(self):
-        """Probe clients and servers
-        evry N seconds to check still connected."""
-
-        # Seconds to sleep between probe attempts
-        probe_cycle = 10
-
-        while True:
-            # Sleep if no servers and no clients
-            if not any(d.get("clients") or d.get("servers") for d in self.mounts.values()):
-                await asyncio.sleep(probe_cycle)
-                continue
-
-            for mount, conns in self.mounts.items():
-                for s_writer, _ in list(conns["servers"].items()):
-                    try:
-                        s_writer.write(b"")
-                        await s_writer.drain()
-                    except OSError:
-                        await self.drop_connection(mount, s_writer, conn_type="server")
-                        try:
-                            s_writer.close()
-                            await s_writer.wait_closed()
-                        except OSError as e:
-                            if DEBUG:
-                                print_exception(e)
-                    except OSError as e:
-                        if DEBUG:
-                            print_exception(e)
-                for c_writer, c_reader in list(conns["clients"].items()):
-                    try:
-                        probe = await c_reader.read(128)
-                        if not probe:
-                            await self.drop_connection(mount, c_writer)
-                            try:
-                                c_writer.close()
-                                await c_writer.wait_closed()
-                            except OSError as e:
-                                if DEBUG:
-                                    print_exception(e)
-                    except OSError:
-                        await self.drop_connection(mount, c_writer)
-                        try:
-                            c_writer.close()
-                            await c_writer.wait_closed()
-                        except OSError as e:
-                            if DEBUG:
-                                print_exception(e)
-
-            gc.collect()
-            await asyncio.sleep(probe_cycle)
-
-    async def server_loop(self, mount, conns, s_writer, s_reader):
-        """Loop reading from server and writing to client(s)"""
-        try:
-            while True:
-                if mount not in self.mounts:
-                    # No server associated with this mount any more.
-                    if DEBUG:
-                        log(f"No server providing data for mount {mount} - exiting task.")
-                    # Delete from the list of running tasks
-                    self.server_tasks.pop(mount, None)
-                    break
-                try:
-                    # Max msg length for RTCM is 1023
-                    data = await asyncio.wait_for(s_reader.read(1024), 1)
-                    if not data:
-                        # Empty data = server disconnect
-                        raise OSError
-                except asyncio.TimeoutError:
-                    # Avoid blocking on server reads
-                    continue
-                except OSError as e:
-                    await self.drop_connection(mount, s_writer, conn_type="server")
-                    break
-                cli_remove = []
-                for c_writer, _ in conns["clients"].items():
-                    try:
-                        c_writer.write(data)
-                        await c_writer.drain()
-                    except OSError:
-                        # Flag client for removal at end of loop
-                        cli_remove.append(c_writer)
-                        # Don't send more messages
-                        break
-                for c_writer in cli_remove:
-                    await self.drop_connection(mount, c_writer)
-
-                # Yield control
-                await asyncio.sleep_ms(0)
-        except asyncio.CancelledError:
-            await self.drop_connection(mount, s_writer, conn_type="server")
-        except Exception as e:
-            if DEBUG:
-                print_exception(e)
-            await self.drop_connection(mount, s_writer, conn_type="server")
-
-    async def handle_data(self):
-        while True:
-            for mount, conns in self.mounts.items():
-                for s_writer, s_reader in list(conns["servers"].items()):
-                    if mount not in self.server_tasks:
-                        if DEBUG:
-                            log(f"Starting task for mount: {mount}")
-                        task = asyncio.create_task(self.server_loop(mount, conns, s_writer, s_reader))
-                        self.server_tasks[mount] = task
-            await asyncio.sleep(1)
-
-
-
-    async def handle_connection(self, reader, writer):
-        addr = writer.get_extra_info('peername')
-        log(f"[{self.name}] Connection from: {addr}")
-        try:
-            req = await reader.read(1024)
-            req = req.decode()
-
-        except OSError:
-            return
-
-        # Get client's password from headers
-        password = None
-        client_ver = 2
-        if not "Ntrip-Version: Ntrip/2.0" in req:
-            # v1 client
-            client_ver = 1
-        for line in req.splitlines():
-            if line.startswith("Authorization"):
-                password = line.split("Basic ", 1)[1]
-        try:
-            method, mount, _ = req.split(None,2)
-            if mount == "/":
-                # Send SOURCETABLE to client, then close
-                log(f"[{self.name}] Client requested Sourcetable")
-                await self.send_headers(writer, status="sourcetable", client_ver=client_ver)
-                try:
-                    writer.write(self.sourcetable)
-                    await writer.drain()
-                except OSError as e:
-                    pass
-                finally:
-                    writer.close()
-                    await writer.wait_closed()
-                    return
-
-            mount = mount.lstrip("/")
-            if method == "GET":
-                # Client downloading RTCM data
-                if not password == self.cli_credb64:
-                    raise AuthError
-                if mount not in self.mounts:
-                    # No Server is supplying data for that mountpoint
-                    status = "503"
-                    if mount not in self.allowed_mounts:
-                        # Mount not in sourcetable at all
-                        status = "404"
-                    await self.send_headers(writer, status=status, client_ver=client_ver)
-                    return
-                log(f"[{self.name}] Client subscribed: {addr}")
-                await self.send_headers(writer, content_type="gnss/data", client_ver=client_ver)
-                self.mounts[mount]["clients"][writer] = reader
-                return
-            elif method == "POST":
-                # Server uploading RTCM data
-                if not password == self.srv_credb64:
-                    raise AuthError
-                if mount not in self.allowed_mounts:
-                    # Mount not in sourcetable
-                    await self.send_headers(writer, status="404")
-                    return
-                if mount in self.mounts:
-                    # Another server is supplying this mountpoint
-                    await self.send_headers(writer, status="409")
-                    return
-                log(f"[{self.name}] Server subscribed: {addr}")
-                await self.send_headers(writer)
-                self.mounts[mount] = {"servers": {writer: reader}, "clients": {}}
-        except AuthError:
-            writer.write("HTTP/1.1 401 Invalid Username or Password\r\n\r\n".encode())
-            writer.close()
-            await writer.wait_closed()
-        except OSError:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except OSError:
-                pass
-
-
-    async def run(self):
-        self.get_allowed_mounts()
-        self.tasks = []
-        # Background tasks
-        self.tasks.append(asyncio.create_task(self.handle_data()))
-        self.tasks.append(asyncio.create_task(self.probe_connections()))
-
-        log(f"[{self.name}] Listening on {self.bind_address}:{self.bind_port}")
-        server = await asyncio.start_server(self.handle_connection, self.bind_address, self.bind_port)
-
-        # Wait for shutdown signal
-        await self.shutdown_event.wait()
-        # shutdown server
-        server.close()
-        await server.wait_closed()
-
-    async def shutdown(self):
-        """Cleanup background tasks."""
-        # Clean up all background tasks
-        self.shutdown_event.set()
-        for task in self.tasks:
-            try:
-                task.cancel()
-            except:
-                pass
-        await asyncio.gather(*self.tasks, return_exceptions=True)
