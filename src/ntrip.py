@@ -24,17 +24,7 @@ except ModuleNotFoundError:
 class AuthError(Exception):
     pass
 
-
-example_data = bytes([
-    0xD3, 0x00, 0x40, 0x41, 0x2E, 0x06, 0x44, 0x19, 0x1E, 0xF5, 0x00,
-    0xA4, 0x00, 0x00, 0x10, 0xB6, 0x11, 0x08, 0xC2, 0xE8, 0x1D, 0x58,
-    0x1A, 0x72, 0xC8, 0x46, 0xCD, 0x1A, 0x08, 0xEA, 0x81, 0x2C, 0x3E,
-    0xDC, 0x1B, 0xBB, 0xD9, 0x5D, 0x90, 0x61, 0xE8, 0x05, 0x2F, 0xFB,
-    0x89, 0x9A, 0x4D, 0xCC, 0xEB, 0xFE, 0x4C, 0x25, 0x28, 0xFB, 0x6C,
-    0xDA, 0x7F, 0x61, 0x8E, 0x60, 0x9C, 0xBF, 0xFB, 0x6A, 0x2D, 0x30,
-    0x02, 0x19, 0x8F, 0x73
-])
-
+# from: https://github.com/semuconsulting/pyrtcm
 def calc_crc24q(message: bytes) -> int:
     """
     Perform CRC24Q cyclic redundancy check.
@@ -146,11 +136,9 @@ class Client(Base):
     async def send_gga(self):
         while True:
             try:
-                log("gga loop")
                 log("last gga %s" % self.last_gga)
                 if self.writer and self.last_gga:
                     try:
-                        log("gga %s" % self.last_gga)
                         self.writer.write(self.last_gga)
                         await self.writer.drain()
                         log("free mem %s" % gc.mem_free())
@@ -164,8 +152,6 @@ class Client(Base):
             except (EOFError, OSError) as e:
                 # wait for connection to be re-established
                 await asyncio.sleep(5)
-    # TODO: catch OSError: [Errno 9] EBADF and retry
-
 
 
     async def iter_data(self):
@@ -173,35 +159,27 @@ class Client(Base):
         while True:
             if self.reader:
                 try:
-
-                    # nach zeilen splitten und dann entscheiden ob rtcm oder http?
-                    # todo: seek for first bytes...
-                    # Regular small reads to avoid blocking (RTCM messages are typically < 512 bytes, max 1023)
-                    # maybe detect \r\n as delimeter and then log all non rtcm as possible http errors?
-
                     first_byte = None
                     second_byte = None
 
-
                     while True:
-                        log("iter loop")
-
-
-
 
                         if first_byte and first_byte[0] == 0xd3:
-                            log("First byte is 0xd3")
+                            #log("First byte is 0xd3")
                             second_byte = await self.reader.readexactly(1)
-                            if second_byte[0] == 0x00:
-                                log("Second byte is 0x00")
+                            # six bytes of zero, ten bytes for size
+                            if second_byte[0] & 0x11111100 == 0x00:
+                                #log("Second byte is 0x00")
                                 hdr3 = await self.reader.readexactly(1)
+                                # no bitmask bc the upper six are zero anyway
                                 size = (second_byte[0] << 8) | hdr3[0]
                                 payload = await self.reader.readexactly(size)
                                 crc = await self.reader.readexactly(3)
                                 raw_data = first_byte + second_byte + hdr3 + payload + crc
-                                print(raw_data)
+                                #print(raw_data)
                                 res = calc_crc24q(raw_data)
                                 if res == 0:
+                                    log("valid rtcm packet")
                                     return raw_data
                                 else:
                                     # invalid packet
@@ -211,44 +189,7 @@ class Client(Base):
                                 continue
                         else:
                             first_byte = await self.reader.readexactly(1)
-                            log("first byte %s" % str(first_byte))
-
-
-
-
-
-                    #if first_byte[0] == 0xd3:
-                        #    second_byte = await self.reader.readexactly(1)
-
-                        #    else:
-                    """
-                    # check for empty_bytes = b''?
-                    hdr = await self.reader.readexactly(2)
-                    
-                    
-                    if hdr[0] == 0xd3:
-                        log("RTCM Message")
-                    else:
-                        log("not RTCM")
-                    # RTCM3 (byte1 = 0xd3; byte2 = 0b000000**)
-                    hdr3 = await self.reader.readexactly(1)
-                    size = (hdr[1] << 8) | hdr3[0]
-                    payload = await self.reader.readexactly(size)
-                    crc = await self.reader.readexactly(3)
-                    raw_data = hdr + hdr3 + payload + crc
-                    #print(raw_data)
-                    res = calc_crc24q(raw_data)
-                    if res == 0:
-                        return raw_data
-
-                    #data = await self.reader.read(128)
-                    #if data:
-                        #print("got data")
-                    #    return data
-                    else:
-                        # Stream closed
-                        raise OSError
-                    """
+                            # TODO: fill garbage buffer, see if its an http error and throw exception
 
                 except (EOFError, OSError) as e:
                     if DEBUG:
