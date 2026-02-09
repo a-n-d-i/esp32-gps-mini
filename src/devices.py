@@ -1,6 +1,9 @@
 """Handle GPS & Serial devices via UART, and provide helper functions."""
+import asyncio
+import socket
 import sys
 import time
+import usocket as socket
 try:
     from machine import UART
 except ImportError:
@@ -154,3 +157,32 @@ class Serial():
                         self.uart.write(f"$PLOG,{msg_str}*{chksum}\r\n")
             except Exception as e:
                 sys.print_exception(e)
+
+
+class UdpSender():
+    def __init__(self, host, port):
+        self.sock = None
+        self.host = host
+        self.port = port
+        logging = Logger.getLogger()
+        self.log = logging.log
+        
+    async def connect(self):
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.log("opened udp socket")
+                while self.sock:
+                    await asyncio.sleep(1)
+            except OSError:
+                self.log("error opening socket")
+                await asyncio.sleep(1)
+            
+    async def send(self, data):
+        try:
+            if self.sock:
+                self.sock.sendto(data, (self.host, self.port))
+            else:
+                raise OSError("socket not open")
+        except OSError as e:
+            self.sock = None

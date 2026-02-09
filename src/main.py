@@ -5,7 +5,8 @@ from sys import print_exception
 from time import sleep_ms
 from net import Net
 import config as cfg
-from devices import Logger
+from devices import Logger, UdpSender
+
 
 # Enable debugging for current thread
 
@@ -31,6 +32,7 @@ class ESP32GPS():
         self.ntrip_server = None
         self.ntrip_client = None
         self.tasks = []
+        self.udp_sender = UdpSender(cfg.UDP_IP, cfg.UDP_PORT)
 
     def gps_reset(self):
         if (
@@ -95,8 +97,7 @@ class ESP32GPS():
         # See: https://docs.micropython.org/en/latest/library/espnow.html#espnow-and-wifi-operation
         if ((ssid := getattr(cfg, "WIFI_SSID", None)) and (psk := getattr(cfg, "WIFI_PSK"))):
             self.net.enable_wifi(ssid=cfg.WIFI_SSID, key=cfg.WIFI_PSK)
-        # Start ESPNow if peers provided
-        peers = getattr(cfg, "ESPNOW_PEERS", set())
+
 
 
     def esp32_write_data(self, value):
@@ -179,6 +180,11 @@ class ESP32GPS():
                 await self.ntrip_server.send_data(line)
         except Exception as e:
             log(f"[GPS DATA] NTRIP server send exception: {print_exception(e)}")
+
+        # don't dump error messages to UDP
+        if isNMEA:
+            await self.udp_sender.send(line)
+
         # Settle
         await asyncio.sleep(0)
 
@@ -250,6 +256,9 @@ class ESP32GPS():
                 self.ntrip_client = ntrip.Client(cfg.NTRIP_CASTER, cfg.NTRIP_PORT, cfg.NTRIP_MOUNT, cfg.NTRIP_CLIENT_CREDENTIALS)
                 self.tasks.append(asyncio.create_task(self.ntrip_client.run()))
                 self.tasks.append(asyncio.create_task(self.ntrip_client_read()))
+
+        self.tasks.append(asyncio.create_task(self.udp_sender.connect()))
+
 
         # Wait for shutdown_event signal
         await self.shutdown_event.wait()

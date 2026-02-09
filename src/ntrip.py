@@ -89,6 +89,7 @@ class Base():
                 headers = await self.reader.read(1024)
                 headers = headers.split(b"\r\n")
                 for line in headers:
+                    log(line)
                     if line.endswith(b"200 OK"):
                         break
                 else:
@@ -116,6 +117,7 @@ class Client(Base):
         self.last_gga = None
         self.last_gga_send_time = 0
         self.gga_send_interval = 5  # Send GGA every 5 seconds
+        self.gga_sent = False
 
 
         loop = asyncio.get_event_loop()
@@ -137,10 +139,13 @@ class Client(Base):
         while True:
             try:
                 log("last gga %s" % self.last_gga)
-                if self.writer and self.last_gga:
+                # dont sent position if it's not precise enough
+                # maybe actually parse DOP or whatever and not just go by sentence length...
+                if self.writer and self.last_gga and len(self.last_gga) > 45:
                     try:
                         self.writer.write(self.last_gga)
                         await self.writer.drain()
+                        self.gga_sent = True
                         log("free mem %s" % gc.mem_free())
                         log(f"[{self.name}] Sent GGA to caster: {self.last_gga}")
                     except OSError as err:
@@ -157,11 +162,10 @@ class Client(Base):
     async def iter_data(self):
         """Read data from caster and yield as requested."""
         while True:
-            if self.reader:
+            if self.reader and self.gga_sent:
                 try:
                     first_byte = None
                     second_byte = None
-
                     while True:
 
                         if first_byte and first_byte[0] == 0xd3:
@@ -188,7 +192,18 @@ class Client(Base):
                                 first_byte = second_byte
                                 continue
                         else:
-                            first_byte = await self.reader.readexactly(1)
+                            #first_byte = await self.reader.readexactly(1)
+                            while True:
+                                first_byte = await self.reader.read(1)
+                                if first_byte != b"":
+                                    # crude check to see if we're getting back http errors...
+                                    if first_byte == b"H":
+                                        line = await self.reader.readline()
+                                        log(line)
+                                    break
+                                else:
+                                    await asyncio.sleep(0.1)
+
                             # TODO: fill garbage buffer, see if its an http error and throw exception
 
                 except (EOFError, OSError) as e:
@@ -211,13 +226,11 @@ class Client(Base):
 
     async def run(self):
         while True:
-            await self.caster_connect()
-
-            log("connrcted")
+            # only try to connect if we have a decent gga sentence, sapos seems to get mad if it gets bad data or no data.
+            if self.last_gga and len(self.last_gga) > 45:
+                await self.caster_connect()
             while self.reader and self.writer:
-                log("loop")
-                #if self.last_gga:
-                #    log( self.last_gga)
                 # Long sleep while connection established (equivalent to reconnect timeout)
                 await asyncio.sleep(RECONNECT_TIMEOUT)
+            await asyncio.sleep(10)
 
